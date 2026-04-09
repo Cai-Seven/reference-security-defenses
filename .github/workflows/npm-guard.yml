@@ -25,7 +25,7 @@ jobs:
       - name: Checkout security defenses repo
         uses: actions/checkout@v4
         with:
-          repository: <org-or-owner>/reference-security-defenses
+          repository: Cai-Seven/reference-security-defenses
           ref: main
           path: .guard
           # 如果 reference-security-defenses 是私有仓库，取消注释并配置 token：
