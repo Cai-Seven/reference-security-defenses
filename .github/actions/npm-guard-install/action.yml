@@ -1,0 +1,48 @@
+name: "npm-guard-install"
+description: "Validate deps (age/whitelist) then run npm install"
+inputs:
+  max_age_days:
+    description: "Minimum age of package versions (days)"
+    required: false
+    default: "14"
+  registry_url:
+    description: "NPM registry URL"
+    required: false
+    default: "https://registry.npmjs.org"
+  rules_config_file:
+    description: "Path to rules config in defenses repo"
+    required: false
+    default: ".guard/config/rules.config.json"
+  whitelist_file:
+    description: "Path to whitelist in defenses repo"
+    required: false
+    default: ".guard/config/package-whitelist.json"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout security defenses repo
+      uses: actions/checkout@v4
+      with:
+        repository: Cai-Seven/reference-security-defenses
+        ref: main
+        path: .guard
+
+    - name: Prepare logs
+      shell: bash
+      run: mkdir -p logs
+
+    - name: Validate dependencies before npm install
+      shell: bash
+      env:
+        MAX_PACKAGE_AGE_DAYS: ${{ inputs.max_age_days }}
+        NPM_REGISTRY_URL: ${{ inputs.registry_url }}
+        RULES_CONFIG_FILE: ${{ inputs.rules_config_file }}
+        WHITELIST_FILE: ${{ inputs.whitelist_file }}
+        AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
+        PACKAGE_JSON_FILE: "package.json"
+      run: node .guard/scripts/npm-install-interceptor.js
+
+    - name: npm install
+      shell: bash
+      run: npm install
