@@ -1,76 +1,26 @@
 const fs = require("fs");
 
-const registry = process.env.NPM_REGISTRY_URL || "https://registry.npmjs.org";
-const maxAgeDays = Number(process.env.MAX_PACKAGE_AGE_DAYS || "14");
+const configPath = process.env.NPM_GUARD_CONFIG_FILE || ".guard/config/npm-guard.config.json";
 const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
 const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
-const whitelistFile = process.env.WHITELIST_FILE || "";
-
-// 允许跨大版本回退（你确认不用考虑）
-const allowCrossMajorFallback = true;
-
-// 回退时只选正式版（不选 -canary/-rc/-beta/-alpha 等 pre-release）
-const fallbackOnlyStable = true;
-
-// 如果 true：永不 fallback，只严格按 spec
-const strictSemver = String(process.env.STRICT_SEMVER || "false").toLowerCase() === "true";
 
 function appendAudit(line) {
   fs.mkdirSync("logs", { recursive: true });
   fs.appendFileSync(auditFile, line + "\n");
 }
 
-function readWhitelist(filePath) {
-  const allowList = new Map(); // name -> Set(versions)
-  if (!filePath) return allowList;
-
-  if (!fs.existsSync(filePath)) {
-    appendAudit(`[WHITELIST] file not found: ${filePath} (treat as empty)`);
-    return allowList;
-  }
-
-  try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    const json = JSON.parse(raw);
-
-    // Supported formats:
-    // 1) { "allow_list": { "pkg": ["1.0.0"] } }
-    // 2) { "allow": ["pkgA", "pkgB"] }  (legacy: allow all versions for those names)
-    // 3) ["pkgA", "pkgB"]               (legacy)
-    if (json && typeof json === "object" && json.allow_list && typeof json.allow_list === "object") {
-      for (const [name, versions] of Object.entries(json.allow_list)) {
-        const set = new Set(Array.isArray(versions) ? versions.map(String) : []);
-        allowList.set(String(name), set);
-      }
-      appendAudit(`[WHITELIST] loaded allow_list entries=${allowList.size} from ${filePath}`);
-      return allowList;
-    }
-
-    const legacyArr = Array.isArray(json) ? json : Array.isArray(json.allow) ? json.allow : [];
-    for (const name of legacyArr.map(String)) {
-      allowList.set(name, new Set(["*"]));
-    }
-    appendAudit(`[WHITELIST] loaded legacy allow entries=${allowList.size} from ${filePath}`);
-    return allowList;
-  } catch (e) {
-    appendAudit(`[WHITELIST] failed to parse ${filePath}: ${String(e?.message || e)} (treat as empty)`);
-    return new Map();
-  }
+function readJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
 function isExactVersion(spec) {
   return /^\d+\.\d+\.\d+$/.test(String(spec).trim());
 }
 
-function isAllowedByWhitelist(allowList, name, requestedSpec) {
-  const set = allowList.get(name);
-  if (!set) return false;
-
-  if (set.has("*")) return true;
-
-  if (!isExactVersion(requestedSpec)) return false;
-  return set.has(String(requestedSpec).trim());
+function isStableSemver(v) {
+  // Stable release: no pre-release suffix (e.g. "-canary", "-rc", "-beta")
+  return /^\d+\.\d+\.\d+$/.test(String(v).trim());
 }
 
 function daysBetween(a, b) {
@@ -83,10 +33,9 @@ async function fetchJson(url) {
   return res.json();
 }
 
-// Supports only: exact x.y.z, ^x.y.z, ~x.y.z
 function minBaseFromSpec(spec) {
   const s = String(spec).trim();
-  if (/^\d+\.\d+\.\d+$/.test(s)) return s;
+  if (isExactVersion(s)) return s;
   if (/^[\^~]\d+\.\d+\.\d+$/.test(s)) return s.slice(1);
   return null;
 }
@@ -111,15 +60,6 @@ function sameMajorMinor(a, b) {
   return aa[0] === bb[0] && aa[1] === bb[1];
 }
 
-/**
- * “正式版/稳定版”判断：必须是 3 段数字 x.y.z，不能带 -canary/-rc/-beta 等 pre-release 后缀
- * - true:  16.2.1
- * - false: 16.2.1-canary.3
- */
-function isStableSemver(v) {
-  return /^\d+\.\d+\.\d+$/.test(String(v).trim());
-}
-
 function allowedBySpecStrict(version, spec) {
   const s = String(spec).trim();
 
@@ -141,11 +81,23 @@ function allowedBySpecStrict(version, spec) {
   return false;
 }
 
-async function resolveOne(pkgName, spec) {
+function isAllowedByWhitelist(allowList, name, requestedSpec) {
+  const set = allowList[name];
+  if (!set) return false;
+
+  if (set === "*" || (Array.isArray(set) && set.includes("*"))) return true;
+
+  if (!isExactVersion(requestedSpec)) return false;
+  return Array.isArray(set) && set.includes(String(requestedSpec).trim());
+}
+
+async function resolveOne(meta, pkgName, spec) {
+  const { registryUrl, maxAgeDays, allowCrossMajorFallback, fallbackOnlyStable } = meta;
+
   const encoded = pkgName.startsWith("@") ? pkgName.replace("/", "%2F") : pkgName;
-  const meta = await fetchJson(`${registry}/${encoded}`);
-  const times = meta.time || {};
-  const versions = Object.keys(meta.versions || {});
+  const info = await fetchJson(`${registryUrl}/${encoded}`);
+  const times = info.time || {};
+  const versions = Object.keys(info.versions || {});
 
   const now = new Date();
   const cutoff = new Date(now.getTime() - maxAgeDays * 24 * 3600 * 1000);
@@ -159,28 +111,14 @@ async function resolveOne(pkgName, spec) {
       .sort((a, b) => cmpVer(a.v, b.v));
   }
 
-  // 1) strict per requested spec (strict 阶段不额外过滤稳定版；保持对 spec 的尊重)
   let candidates = candidatesByFilter((v) => allowedBySpecStrict(v, spec));
 
-  // 2) fallback: cross-major，��只选正式版
-  const canFallback = !strictSemver && allowCrossMajorFallback;
-  if (candidates.length === 0 && canFallback) {
+  if (candidates.length === 0 && allowCrossMajorFallback) {
     candidates = candidatesByFilter((v) => (fallbackOnlyStable ? isStableSemver(v) : true));
-    if (candidates.length > 0) {
-      appendAudit(
-        `[FALLBACK] ${pkgName}@${spec} -> using cross-major fallback` +
-          (fallbackOnlyStable ? " (stable only)" : "") +
-          " due to age gate"
-      );
-    }
   }
 
   if (candidates.length === 0) {
-    return {
-      requested: String(spec),
-      safe: null,
-      reason: `no version satisfies age>=${maxAgeDays}d under ${canFallback ? "strict+fallback" : "strict"} rules`,
-    };
+    return { requested: String(spec), safe: null, reason: `no version satisfies age>=${maxAgeDays}d` };
   }
 
   const chosen = candidates[candidates.length - 1];
@@ -196,128 +134,92 @@ async function resolveOne(pkgName, spec) {
 }
 
 function applySafeVersionsToPkg(pkg, resolution, allowList) {
-  function applySection(sectionName) {
-    if (!pkg[sectionName]) return;
-    for (const [name, spec] of Object.entries(pkg[sectionName])) {
+  for (const sectionName of ["dependencies", "devDependencies"]) {
+    const section = pkg[sectionName];
+    if (!section) continue;
+
+    for (const [name, spec] of Object.entries(section)) {
       if (isAllowedByWhitelist(allowList, name, spec)) {
-        appendAudit(`[WHITELIST] ${sectionName}.${name}: allowed spec ${spec} -> keep`);
+        appendAudit(`[WHITELIST] ${sectionName}.${name}: keep ${spec}`);
         continue;
       }
       const r = resolution.packages?.[name];
       if (!r || !r.safe) continue;
-      pkg[sectionName][name] = r.safe; // pin exact
+      section[name] = r.safe;
       appendAudit(`[APPLY] ${sectionName}.${name}: ${spec} -> ${r.safe}${r.fallback ? " [FALLBACK]" : ""}`);
     }
   }
-  applySection("dependencies");
-  applySection("devDependencies");
 }
 
-function updateShrinkwrapIfPresent(allowList, pkgJson) {
+function updateShrinkwrapIfPresent(pkgJson) {
   const shrinkwrapPath = "npm-shrinkwrap.json";
-  if (!fs.existsSync(shrinkwrapPath)) return false;
+  if (!fs.existsSync(shrinkwrapPath)) return;
 
-  const sw = JSON.parse(fs.readFileSync(shrinkwrapPath, "utf8"));
+  const sw = readJson(shrinkwrapPath);
   const pkgs = sw.packages || {};
 
-  const pinned = new Set();
   for (const sectionName of ["dependencies", "devDependencies"]) {
     const section = pkgJson[sectionName] || {};
     for (const [name, spec] of Object.entries(section)) {
-      if (!isAllowedByWhitelist(allowList, name, spec) && isExactVersion(spec)) pinned.add(name);
-    }
-  }
+      if (!isExactVersion(spec)) continue;
 
-  for (const name of pinned) {
-    const safe = pkgJson.dependencies?.[name] || pkgJson.devDependencies?.[name];
-    if (!safe) continue;
-
-    const key = `node_modules/${name}`;
-    if (pkgs[key] && pkgs[key].version && pkgs[key].version !== safe) {
-      appendAudit(`[SHRINKWRAP] ${name}: ${pkgs[key].version} -> ${safe}`);
-      pkgs[key].version = safe;
-      delete pkgs[key].resolved;
-      delete pkgs[key].integrity;
+      const key = `node_modules/${name}`;
+      if (pkgs[key] && pkgs[key].version && pkgs[key].version !== spec) {
+        pkgs[key].version = spec;
+        delete pkgs[key].resolved;
+        delete pkgs[key].integrity;
+        appendAudit(`[SHRINKWRAP] ${name}: -> ${spec}`);
+      }
     }
   }
 
   sw.packages = pkgs;
   fs.writeFileSync(shrinkwrapPath, JSON.stringify(sw, null, 2) + "\n");
-  appendAudit("Updated existing npm-shrinkwrap.json (top-level packages pinned; resolved/integrity cleared for refresh).");
-  return true;
 }
 
 async function main() {
-  console.log("[npm-guard] script start");
-  console.log("[npm-guard] node:", process.version);
-  console.log("[npm-guard] cwd:", process.cwd());
-  console.log("[npm-guard] registry:", registry);
-  console.log("[npm-guard] maxAgeDays:", maxAgeDays);
-  console.log("[npm-guard] packageJsonFile:", packageJsonFile);
-  console.log("[npm-guard] whitelistFile:", whitelistFile);
-  console.log("[npm-guard] strictSemver:", strictSemver);
-  console.log("[npm-guard] allowCrossMajorFallback:", allowCrossMajorFallback);
-  console.log("[npm-guard] fallbackOnlyStable:", fallbackOnlyStable);
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`Config file not found: ${configPath}`);
+  }
+
+  const config = readJson(configPath);
+  const meta = {
+    registryUrl: config.registry_url || "https://registry.npmjs.org",
+    maxAgeDays: Number(config.max_age_days || 14),
+    allowCrossMajorFallback: config.allow_cross_major_fallback !== false,
+    fallbackOnlyStable: config.fallback_only_stable !== false,
+    allowList: config.allow_list || {},
+  };
 
   fs.mkdirSync("logs", { recursive: true });
-  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (allow_list + stable-only fallback) ==========");
 
-  const allowList = readWhitelist(whitelistFile);
-
-  const pkg = JSON.parse(fs.readFileSync(packageJsonFile, "utf8"));
-  console.log("[npm-guard] loaded package.json");
-
+  const pkg = readJson(packageJsonFile);
   const deps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
 
   const resolution = {
-    maxAgeDays,
-    registry,
+    maxAgeDays: meta.maxAgeDays,
+    registry: meta.registryUrl,
     generatedAt: new Date().toISOString(),
     packages: {},
   };
 
   for (const [name, spec] of Object.entries(deps)) {
-    if (isAllowedByWhitelist(allowList, name, spec)) {
+    if (isAllowedByWhitelist(meta.allowList, name, spec)) {
       resolution.packages[name] = { requested: String(spec), safe: null, reason: "allow_list" };
-      appendAudit(`[WHITELIST] allowed ${name}@${spec} -> skip resolving`);
       continue;
     }
-
-    try {
-      const r = await resolveOne(name, spec);
-      resolution.packages[name] = r;
-
-      if (r.safe) {
-        appendAudit(
-          `[SAFE] ${name}@${spec} -> ${r.safe} (ageDays=${r.ageDays})` + (r.fallback ? " [FALLBACK]" : "")
-        );
-      } else {
-        appendAudit(`[UNRESOLVED] ${name}@${spec} -> (no safe version) reason=${r.reason}`);
-      }
-    } catch (e) {
-      resolution.packages[name] = { requested: String(spec), safe: null, reason: String(e?.message || e) };
-      appendAudit(`[ERROR] ${name}@${spec} -> ${resolution.packages[name].reason}`);
-    }
+    resolution.packages[name] = await resolveOne(meta, name, spec);
   }
 
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
-  console.log("[npm-guard] wrote resolution:", outFile);
-  appendAudit(`Wrote resolution: ${outFile}`);
+  applySafeVersionsToPkg(pkg, resolution, meta.allowList);
+  fs.writeFileSync(packageJsonFile, JSON.stringify(pkg, null, 2) + "\n");
 
-  applySafeVersionsToPkg(pkg, resolution, allowList);
-  fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
-  console.log("[npm-guard] wrote updated package.json");
-  appendAudit("Updated package.json with safe versions (runner only).");
-
-  if (fs.existsSync("npm-shrinkwrap.json")) {
-    updateShrinkwrapIfPresent(allowList, pkg);
-  } else {
-    appendAudit("No npm-shrinkwrap.json found: action will generate one after npm install (npm shrinkwrap).");
-  }
+  updateShrinkwrapIfPresent(pkg);
 }
 
 main().catch((err) => {
-  console.error("[npm-guard] fatal:", err);
+  console.error(err);
   appendAudit(`[FATAL] ${String(err?.message || err)}`);
   process.exit(1);
 });
