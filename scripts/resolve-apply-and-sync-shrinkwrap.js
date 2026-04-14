@@ -112,19 +112,54 @@ function loadAllowList(filePath) {
   }
 }
 
-function isAllowedByAllowList(allowList, name, requestedSpec) {
+function getAllowRule(allowList, name) {
   const rule = allowList[name];
-  if (!rule) return false;
-
-  if (rule === "*" || (Array.isArray(rule) && rule.includes("*"))) return true;
-
-  if (!isExactVersion(requestedSpec)) return false;
-  return Array.isArray(rule) && rule.includes(String(requestedSpec).trim());
+  if (!rule) return null;
+  if (rule === "*") return { any: true, versions: [] };
+  if (Array.isArray(rule) && rule.includes("*")) return { any: true, versions: [] };
+  if (Array.isArray(rule)) return { any: false, versions: rule.map(String) };
+  return null;
 }
 
-async function resolveOne(meta, pkgName, spec) {
+/**
+ * If allow_list has explicit versions, we FORCE pin to one of those versions.
+ * This applies even when requestedSpec is a range (e.g. ^11.12.0).
+ *
+ * By default, allow_list bypasses age gate (temporary allow).
+ */
+async function pickAllowedVersion(registryUrl, pkgName, allowedVersions) {
+  // Choose the highest allowed version that exists in the registry metadata.
+  // (Do not assume allowed list is valid; verify existence.)
+  const encoded = pkgName.startsWith("@") ? pkgName.replace("/", "%2F") : pkgName;
+  const info = await fetchJson(`${registryUrl}/${encoded}`);
+  const versions = new Set(Object.keys(info.versions || {}));
+
+  const existing = allowedVersions.filter((v) => versions.has(v));
+  existing.sort((a, b) => cmpVer(a, b));
+  return existing.length ? existing[existing.length - 1] : null;
+}
+
+async function resolveOne(meta, allowList, pkgName, spec) {
   const { registryUrl, maxAgeDays, allowCrossMajorFallback, fallbackOnlyStable } = meta;
 
+  // 0) allow_list override
+  const rule = getAllowRule(allowList, pkgName);
+  if (rule) {
+    if (rule.any) {
+      return { requested: String(spec), safe: null, reason: "allow_list:any" };
+    }
+
+    const chosen = await pickAllowedVersion(registryUrl, pkgName, rule.versions);
+    if (chosen) {
+      appendAudit(`[ALLOW_LIST] ${pkgName}@${spec} -> pin ${chosen}`);
+      return { requested: String(spec), safe: chosen, reason: "allow_list:pin" };
+    }
+
+    // If allow_list has versions but none exist, fall through to normal resolution.
+    appendAudit(`[ALLOW_LIST] ${pkgName}: allowed versions not found in registry, falling back to resolver`);
+  }
+
+  // 1) strict per requested spec + age gate
   const encoded = pkgName.startsWith("@") ? pkgName.replace("/", "%2F") : pkgName;
   const info = await fetchJson(`${registryUrl}/${encoded}`);
   const times = info.time || {};
@@ -144,6 +179,7 @@ async function resolveOne(meta, pkgName, spec) {
 
   let candidates = candidatesByFilter((v) => allowedBySpecStrict(v, spec));
 
+  // 2) fallback: cross-major, stable only
   if (candidates.length === 0 && allowCrossMajorFallback) {
     candidates = candidatesByFilter((v) => (fallbackOnlyStable ? isStableSemver(v) : true));
     if (candidates.length > 0) {
@@ -173,9 +209,10 @@ function applySafeVersionsToPkg(pkg, resolution, allowList) {
     if (!section) continue;
 
     for (const [name, spec] of Object.entries(section)) {
-      if (isAllowedByAllowList(allowList, name, spec)) {
-        continue;
-      }
+      // If allow_list:any, keep original spec unchanged.
+      const rule = getAllowRule(allowList, name);
+      if (rule && rule.any) continue;
+
       const r = resolution.packages?.[name];
       if (!r || !r.safe) continue;
       section[name] = r.safe;
@@ -201,7 +238,6 @@ function updateShrinkwrapIfPresent(pkgJson) {
         pkgs[key].version = spec;
         delete pkgs[key].resolved;
         delete pkgs[key].integrity;
-        appendAudit(`[SHRINKWRAP] ${name}: -> ${spec}`);
       }
     }
   }
@@ -211,9 +247,7 @@ function updateShrinkwrapIfPresent(pkgJson) {
 }
 
 async function main() {
-  if (!fs.existsSync(configPath)) {
-    throw new Error(`Config file not found: ${configPath}`);
-  }
+  if (!fs.existsSync(configPath)) throw new Error(`Config file not found: ${configPath}`);
 
   const config = readJson(configPath);
   const allowList = loadAllowList(allowListPath);
@@ -238,11 +272,7 @@ async function main() {
   };
 
   for (const [name, spec] of Object.entries(deps)) {
-    if (isAllowedByAllowList(allowList, name, spec)) {
-      resolution.packages[name] = { requested: String(spec), safe: null, reason: "allow_list" };
-      continue;
-    }
-    resolution.packages[name] = await resolveOne(meta, name, spec);
+    resolution.packages[name] = await resolveOne(meta, allowList, name, spec);
   }
 
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
