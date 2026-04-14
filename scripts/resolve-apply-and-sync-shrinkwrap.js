@@ -6,9 +6,38 @@ const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
 const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
 
+// NOTE: This is expected to be a path inside the checked-out defenses repo,
+// e.g. ".guard/config/package-whitelist.json" (default).
+const whitelistFile = process.env.WHITELIST_FILE || "";
+
 function appendAudit(line) {
   fs.mkdirSync("logs", { recursive: true });
   fs.appendFileSync(auditFile, line + "\n");
+}
+
+function readWhitelist(filePath) {
+  if (!filePath) return new Set();
+
+  if (!fs.existsSync(filePath)) {
+    appendAudit(`[WHITELIST] file not found: ${filePath} (treat as empty)`);
+    return new Set();
+  }
+
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    const json = JSON.parse(raw);
+
+    // Supported formats:
+    // 1) ["pkg-a", "pkg-b"]
+    // 2) { "allow": ["pkg-a", "pkg-b"] }
+    const arr = Array.isArray(json) ? json : Array.isArray(json.allow) ? json.allow : [];
+    const set = new Set(arr.map(String));
+    appendAudit(`[WHITELIST] loaded ${set.size} entries from ${filePath}`);
+    return set;
+  } catch (e) {
+    appendAudit(`[WHITELIST] failed to parse ${filePath}: ${String(e?.message || e)} (treat as empty)`);
+    return new Set();
+  }
 }
 
 function daysBetween(a, b) {
@@ -105,10 +134,14 @@ async function resolveOne(pkgName, spec) {
   };
 }
 
-function applySafeVersionsToPkg(pkg, resolution) {
+function applySafeVersionsToPkg(pkg, resolution, whitelist) {
   function applySection(sectionName) {
     if (!pkg[sectionName]) return;
     for (const [name, spec] of Object.entries(pkg[sectionName])) {
+      if (whitelist.has(name)) {
+        appendAudit(`[WHITELIST] ${sectionName}.${name}: keep requested spec ${spec}`);
+        continue;
+      }
       const r = resolution.packages?.[name];
       if (!r || !r.safe) continue;
       pkg[sectionName][name] = r.safe; // pin exact
@@ -119,9 +152,9 @@ function applySafeVersionsToPkg(pkg, resolution) {
   applySection("devDependencies");
 }
 
-// Update shrinkwrap.json packages[] entries for top-level deps we pinned.
+// Update shrinkwrap.json packages[] entries for top-level deps we pinned (excluding whitelisted).
 // We clear resolved/integrity to let npm refresh them during install.
-function updateShrinkwrapIfPresent(resolution) {
+function updateShrinkwrapIfPresent(resolution, whitelist) {
   const shrinkwrapPath = "npm-shrinkwrap.json";
   if (!fs.existsSync(shrinkwrapPath)) return false;
 
@@ -130,6 +163,10 @@ function updateShrinkwrapIfPresent(resolution) {
 
   for (const [name, r] of Object.entries(resolution.packages || {})) {
     if (!r.safe) continue;
+    if (whitelist.has(name)) {
+      appendAudit(`[WHITELIST] shrinkwrap ${name}: keep existing locked version`);
+      continue;
+    }
 
     const key = `node_modules/${name}`;
     if (pkgs[key] && pkgs[key].version && pkgs[key].version !== r.safe) {
@@ -148,7 +185,9 @@ function updateShrinkwrapIfPresent(resolution) {
 
 async function main() {
   fs.mkdirSync("logs", { recursive: true });
-  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap ==========");
+  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (with whitelist) ==========");
+
+  const whitelist = readWhitelist(whitelistFile);
 
   const pkg = JSON.parse(fs.readFileSync(packageJsonFile, "utf8"));
   const deps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
@@ -161,6 +200,12 @@ async function main() {
   };
 
   for (const [name, spec] of Object.entries(deps)) {
+    if (whitelist.has(name)) {
+      resolution.packages[name] = { requested: String(spec), safe: null, reason: "whitelisted" };
+      appendAudit(`[WHITELIST] skip resolving ${name}@${spec}`);
+      continue;
+    }
+
     try {
       const r = await resolveOne(name, spec);
       resolution.packages[name] = r;
@@ -179,12 +224,12 @@ async function main() {
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
   appendAudit(`Wrote resolution: ${outFile}`);
 
-  applySafeVersionsToPkg(pkg, resolution);
+  applySafeVersionsToPkg(pkg, resolution, whitelist);
   fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
   appendAudit("Updated package.json with safe versions (runner only).");
 
   if (fs.existsSync("npm-shrinkwrap.json")) {
-    updateShrinkwrapIfPresent(resolution);
+    updateShrinkwrapIfPresent(resolution, whitelist);
   } else {
     appendAudit("No npm-shrinkwrap.json found: action will generate one after npm install (npm shrinkwrap).");
   }
