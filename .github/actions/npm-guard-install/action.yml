@@ -1,5 +1,6 @@
 name: "npm-guard-install"
 description: "Auto-resolve safe versions (age-gated) and install deterministically"
+
 inputs:
   max_age_days:
     description: "Minimum age of package versions (days)"
@@ -32,8 +33,6 @@ runs:
       shell: bash
       run: mkdir -p logs
 
-    # Resolve safe versions and apply them to package.json in the current workspace
-    # (runner only; nothing is committed back to the app repo).
     - name: Resolve + apply safe versions (runner only)
       shell: bash
       env:
@@ -46,25 +45,14 @@ runs:
         AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
       run: node .guard/scripts/resolve-and-apply-safe-versions.js
 
-    # Create/refresh lockfile based on the now-safe pinned versions (runner only)
     - name: Generate package-lock.json (runner only)
       shell: bash
       run: |
         rm -rf node_modules
+        rm -f package-lock.json npm-shrinkwrap.json
         npm install --package-lock-only --ignore-scripts
 
-    # Deterministic install
     - name: Install from lockfile
       shell: bash
       run: |
         npm ci --ignore-scripts
-
-    - name: Show resolved direct dependency versions
-      shell: bash
-      run: |
-        node - <<'NODE'
-        const fs = require('fs');
-        const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
-        console.log('dependencies:', pkg.dependencies || {});
-        console.log('devDependencies:', pkg.devDependencies || {});
-        NODE
