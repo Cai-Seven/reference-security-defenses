@@ -7,16 +7,13 @@ const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
 const whitelistFile = process.env.WHITELIST_FILE || "";
 
-/**
- * With cross-major fallback enabled:
- * - First try: respect requested spec (^/~ or exact) + age gate.
- * - If none, fallback: choose the newest version (any major) that satisfies age gate.
- *
- * This matches: "不用考虑 直接夸大版本" (allow cross-major downgrade freely).
- */
+// 允许跨大版本回退（你确认不用考虑）
 const allowCrossMajorFallback = true;
 
-// If true: NEVER fallback, only strict spec.
+// 回退时只选正式版（不选 -canary/-rc/-beta/-alpha 等 pre-release）
+const fallbackOnlyStable = true;
+
+// 如果 true：永不 fallback，只严格按 spec
 const strictSemver = String(process.env.STRICT_SEMVER || "false").toLowerCase() === "true";
 
 function appendAudit(line) {
@@ -114,6 +111,15 @@ function sameMajorMinor(a, b) {
   return aa[0] === bb[0] && aa[1] === bb[1];
 }
 
+/**
+ * “正式版/稳定版”判断：必须是 3 段数字 x.y.z，不能带 -canary/-rc/-beta 等 pre-release 后缀
+ * - true:  16.2.1
+ * - false: 16.2.1-canary.3
+ */
+function isStableSemver(v) {
+  return /^\d+\.\d+\.\d+$/.test(String(v).trim());
+}
+
 function allowedBySpecStrict(version, spec) {
   const s = String(spec).trim();
 
@@ -153,15 +159,19 @@ async function resolveOne(pkgName, spec) {
       .sort((a, b) => cmpVer(a.v, b.v));
   }
 
-  // 1) strict per requested spec
+  // 1) strict per requested spec (strict 阶段不额外过滤稳定版；保持对 spec 的尊重)
   let candidates = candidatesByFilter((v) => allowedBySpecStrict(v, spec));
 
-  // 2) fallback: any version (cross-major) as long as it meets age gate
+  // 2) fallback: cross-major，��只选正式版
   const canFallback = !strictSemver && allowCrossMajorFallback;
   if (candidates.length === 0 && canFallback) {
-    candidates = candidatesByFilter(() => true);
+    candidates = candidatesByFilter((v) => (fallbackOnlyStable ? isStableSemver(v) : true));
     if (candidates.length > 0) {
-      appendAudit(`[FALLBACK] ${pkgName}@${spec} -> using cross-major fallback due to age gate`);
+      appendAudit(
+        `[FALLBACK] ${pkgName}@${spec} -> using cross-major fallback` +
+          (fallbackOnlyStable ? " (stable only)" : "") +
+          " due to age gate"
+      );
     }
   }
 
@@ -169,7 +179,7 @@ async function resolveOne(pkgName, spec) {
     return {
       requested: String(spec),
       safe: null,
-      reason: `no version satisfies age>=${maxAgeDays}d under ${canFallback ? "strict+cross-major-fallback" : "strict"} rules`,
+      reason: `no version satisfies age>=${maxAgeDays}d under ${canFallback ? "strict+fallback" : "strict"} rules`,
     };
   }
 
@@ -181,7 +191,7 @@ async function resolveOne(pkgName, spec) {
     safe: chosen.v,
     publishTime: chosen.t.toISOString(),
     ageDays: Number(age.toFixed(2)),
-    fallback: candidates.length > 0 && !allowedBySpecStrict(chosen.v, spec),
+    fallback: !allowedBySpecStrict(chosen.v, spec),
   };
 }
 
@@ -195,8 +205,8 @@ function applySafeVersionsToPkg(pkg, resolution, allowList) {
       }
       const r = resolution.packages?.[name];
       if (!r || !r.safe) continue;
-      pkg[sectionName][name] = r.safe; // pin exact to the chosen safe version
-      appendAudit(`[APPLY] ${sectionName}.${name}: ${spec} -> ${r.safe}${r.fallback ? " (cross-major fallback)" : ""}`);
+      pkg[sectionName][name] = r.safe; // pin exact
+      appendAudit(`[APPLY] ${sectionName}.${name}: ${spec} -> ${r.safe}${r.fallback ? " [FALLBACK]" : ""}`);
     }
   }
   applySection("dependencies");
@@ -247,9 +257,10 @@ async function main() {
   console.log("[npm-guard] whitelistFile:", whitelistFile);
   console.log("[npm-guard] strictSemver:", strictSemver);
   console.log("[npm-guard] allowCrossMajorFallback:", allowCrossMajorFallback);
+  console.log("[npm-guard] fallbackOnlyStable:", fallbackOnlyStable);
 
   fs.mkdirSync("logs", { recursive: true });
-  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (version allow_list + cross-major fallback) ==========");
+  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (allow_list + stable-only fallback) ==========");
 
   const allowList = readWhitelist(whitelistFile);
 
@@ -277,7 +288,9 @@ async function main() {
       resolution.packages[name] = r;
 
       if (r.safe) {
-        appendAudit(`[SAFE] ${name}@${spec} -> ${r.safe} (ageDays=${r.ageDays})${r.fallback ? " [FALLBACK]" : ""}`);
+        appendAudit(
+          `[SAFE] ${name}@${spec} -> ${r.safe} (ageDays=${r.ageDays})` + (r.fallback ? " [FALLBACK]" : "")
+        );
       } else {
         appendAudit(`[UNRESOLVED] ${name}@${spec} -> (no safe version) reason=${r.reason}`);
       }
