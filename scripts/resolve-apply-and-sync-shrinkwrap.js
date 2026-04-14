@@ -1,20 +1,10 @@
 const fs = require("fs");
 
-console.log("[npm-guard] script start");
-console.log("[npm-guard] node:", process.version);
-console.log("[npm-guard] cwd:", process.cwd());
-console.log("[npm-guard] registry:", registry);
-console.log("[npm-guard] maxAgeDays:", maxAgeDays);
-console.log("[npm-guard] packageJsonFile:", packageJsonFile);
-console.log("[npm-guard] whitelistFile:", whitelistFile);
-
 const registry = process.env.NPM_REGISTRY_URL || "https://registry.npmjs.org";
 const maxAgeDays = Number(process.env.MAX_PACKAGE_AGE_DAYS || "14");
 const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
 const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
-
-// Expected to be a path inside the checked-out defenses repo, e.g. ".guard/config/package-whitelist.json"
 const whitelistFile = process.env.WHITELIST_FILE || "";
 
 function appendAudit(line) {
@@ -193,19 +183,18 @@ function applySafeVersionsToPkg(pkg, resolution, allowList) {
   applySection("devDependencies");
 }
 
-function updateShrinkwrapIfPresent(resolution, allowList, pkgJson) {
+function updateShrinkwrapIfPresent(allowList, pkgJson) {
   const shrinkwrapPath = "npm-shrinkwrap.json";
   if (!fs.existsSync(shrinkwrapPath)) return false;
 
   const sw = JSON.parse(fs.readFileSync(shrinkwrapPath, "utf8"));
   const pkgs = sw.packages || {};
 
-  // We only touch packages we actually pinned in package.json (non-whitelisted ones).
+  // Touch only packages we pinned in package.json (non-whitelisted + exact).
   const pinned = new Set();
   for (const sectionName of ["dependencies", "devDependencies"]) {
     const section = pkgJson[sectionName] || {};
     for (const [name, spec] of Object.entries(section)) {
-      // after applySafeVersionsToPkg(), spec is either original (whitelisted) or exact pinned safe.
       if (!isAllowedByWhitelist(allowList, name, spec) && isExactVersion(spec)) pinned.add(name);
     }
   }
@@ -218,6 +207,8 @@ function updateShrinkwrapIfPresent(resolution, allowList, pkgJson) {
     if (pkgs[key] && pkgs[key].version && pkgs[key].version !== safe) {
       appendAudit(`[SHRINKWRAP] ${name}: ${pkgs[key].version} -> ${safe}`);
       pkgs[key].version = safe;
+
+      // clear to let npm refresh (avoid mismatched tarball/integrity)
       delete pkgs[key].resolved;
       delete pkgs[key].integrity;
     }
@@ -230,12 +221,22 @@ function updateShrinkwrapIfPresent(resolution, allowList, pkgJson) {
 }
 
 async function main() {
+  console.log("[npm-guard] script start");
+  console.log("[npm-guard] node:", process.version);
+  console.log("[npm-guard] cwd:", process.cwd());
+  console.log("[npm-guard] registry:", registry);
+  console.log("[npm-guard] maxAgeDays:", maxAgeDays);
+  console.log("[npm-guard] packageJsonFile:", packageJsonFile);
+  console.log("[npm-guard] whitelistFile:", whitelistFile);
+
   fs.mkdirSync("logs", { recursive: true });
   appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (version allow_list) ==========");
 
   const allowList = readWhitelist(whitelistFile);
 
   const pkg = JSON.parse(fs.readFileSync(packageJsonFile, "utf8"));
+  console.log("[npm-guard] loaded package.json");
+
   const deps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
 
   const resolution = {
@@ -268,22 +269,23 @@ async function main() {
   }
 
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
+  console.log("[npm-guard] wrote resolution:", outFile);
   appendAudit(`Wrote resolution: ${outFile}`);
 
   applySafeVersionsToPkg(pkg, resolution, allowList);
   fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+  console.log("[npm-guard] wrote updated package.json");
   appendAudit("Updated package.json with safe versions (runner only).");
 
   if (fs.existsSync("npm-shrinkwrap.json")) {
-    updateShrinkwrapIfPresent(resolution, allowList, pkg);
+    updateShrinkwrapIfPresent(allowList, pkg);
   } else {
     appendAudit("No npm-shrinkwrap.json found: action will generate one after npm install (npm shrinkwrap).");
   }
 }
 
 main().catch((err) => {
-  console.log("[npm-guard] loaded package.json");
-  console.error(err);
+  console.error("[npm-guard] fatal:", err);
   appendAudit(`[FATAL] ${String(err?.message || err)}`);
   process.exit(1);
 });
