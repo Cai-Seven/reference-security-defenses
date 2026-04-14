@@ -1,5 +1,13 @@
 const fs = require("fs");
 
+console.log("[npm-guard] script start");
+console.log("[npm-guard] node:", process.version);
+console.log("[npm-guard] cwd:", process.cwd());
+console.log("[npm-guard] registry:", registry);
+console.log("[npm-guard] maxAgeDays:", maxAgeDays);
+console.log("[npm-guard] packageJsonFile:", packageJsonFile);
+console.log("[npm-guard] whitelistFile:", whitelistFile);
+
 const registry = process.env.NPM_REGISTRY_URL || "https://registry.npmjs.org";
 const maxAgeDays = Number(process.env.MAX_PACKAGE_AGE_DAYS || "14");
 const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
