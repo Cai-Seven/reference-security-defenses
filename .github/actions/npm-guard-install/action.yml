@@ -1,23 +1,5 @@
 name: "npm-guard-install"
-description: "Auto-resolve safe versions (age-gated), update shrinkwrap if present, generate shrinkwrap if absent, then npm install"
-
-inputs:
-  max_age_days:
-    description: "Minimum age of package versions (days)"
-    required: false
-    default: "14"
-  registry_url:
-    description: "NPM registry URL"
-    required: false
-    default: "https://registry.npmjs.org"
-  rules_config_file:
-    description: "Path to rules config in defenses repo (reserved for compatibility)"
-    required: false
-    default: ".guard/config/rules.config.json"
-  whitelist_file:
-    description: "Path to whitelist JSON in defenses repo"
-    required: false
-    default: ".guard/config/package-whitelist.json"
+description: "Resolve age-gated safe versions, sync shrinkwrap, then npm install"
 
 runs:
   using: "composite"
@@ -33,24 +15,13 @@ runs:
       shell: bash
       run: mkdir -p logs
 
-    - name: Resolve + apply safe versions + pre-sync shrinkwrap (runner only)
+    - name: Resolve + apply safe versions (runner only)
       shell: bash
       env:
-        MAX_PACKAGE_AGE_DAYS: ${{ inputs.max_age_days }}
-        NPM_REGISTRY_URL: ${{ inputs.registry_url }}
-        WHITELIST_FILE: ${{ inputs.whitelist_file }}
         PACKAGE_JSON_FILE: "package.json"
         RESOLUTION_FILE: "logs/npm-guard-resolution.json"
         AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
-      run: |
-        set -euo pipefail
-        node .guard/scripts/resolve-apply-and-sync-shrinkwrap.js
-        echo "==== after guard: package.json ===="
-        cat package.json
-        echo "==== after guard: resolution ===="
-        cat logs/npm-guard-resolution.json
-        echo "==== after guard: audit (tail) ===="
-        tail -n 200 logs/npm-guard-audit.log || true
+      run: node .guard/scripts/resolve-apply-and-sync-shrinkwrap.js
 
     - name: Install (always npm install)
       shell: bash
@@ -59,8 +30,6 @@ runs:
         rm -rf node_modules
         npm install
 
-        # If product didn't ship shrinkwrap, generate one after a successful install.
         if [ ! -f npm-shrinkwrap.json ]; then
-          echo "No npm-shrinkwrap.json present -> generating via npm shrinkwrap"
           npm shrinkwrap
         fi
