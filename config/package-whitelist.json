@@ -1,6 +1,5 @@
 {
   "allow_list": {
-    "type-fest": ["0.3.1", "4.41.0"],
-    "minimist": ["1.2.8"]
+    "@griddo/ax": ["11.12.0"]
   }
 }
