@@ -55,4 +55,4 @@ runs:
     - name: Install from lockfile
       shell: bash
       run: |
-        npm ci --ignore-scripts
+        npm ci
