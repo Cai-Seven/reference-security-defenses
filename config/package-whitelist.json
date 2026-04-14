@@ -1,5 +1,6 @@
 {
   "allow_list": {
-    "@griddo/ax": ["11.12.0"]
+    "@griddo/ax": ["11.12.0"],
+    "@ax-llm/ax": ["19.0.44"]
   }
 }
