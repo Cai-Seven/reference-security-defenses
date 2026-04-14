@@ -52,7 +52,9 @@ runs:
         rm -f package-lock.json npm-shrinkwrap.json
         npm install --package-lock-only --ignore-scripts
 
-    - name: Install from lockfile
+    - name: Install (sync lockfile automatically)
       shell: bash
       run: |
-        npm ci
+        rm -rf node_modules
+        rm -f package-lock.json npm-shrinkwrap.json
+        npm install
