@@ -1,0 +1,10 @@
+{
+  "max_age_days": 14,
+  "registry_url": "https://registry.npmjs.org",
+  "allow_cross_major_fallback": true,
+  "fallback_only_stable": true,
+  "allow_list": {
+    "type-fest": ["0.3.1", "4.41.0"],
+    "minimist": ["1.2.8"]
+  }
+}
