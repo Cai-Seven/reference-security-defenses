@@ -282,6 +282,7 @@ async function main() {
 }
 
 main().catch((err) => {
+  console.log("[npm-guard] loaded package.json");
   console.error(err);
   appendAudit(`[FATAL] ${String(err?.message || err)}`);
   process.exit(1);
