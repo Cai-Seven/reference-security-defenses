@@ -6,8 +6,7 @@ const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
 const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
 
-// NOTE: This is expected to be a path inside the checked-out defenses repo,
-// e.g. ".guard/config/package-whitelist.json" (default).
+// Expected to be a path inside the checked-out defenses repo, e.g. ".guard/config/package-whitelist.json"
 const whitelistFile = process.env.WHITELIST_FILE || "";
 
 function appendAudit(line) {
@@ -16,11 +15,12 @@ function appendAudit(line) {
 }
 
 function readWhitelist(filePath) {
-  if (!filePath) return new Set();
+  const allowList = new Map(); // name -> Set(versions)
+  if (!filePath) return allowList;
 
   if (!fs.existsSync(filePath)) {
     appendAudit(`[WHITELIST] file not found: ${filePath} (treat as empty)`);
-    return new Set();
+    return allowList;
   }
 
   try {
@@ -28,16 +28,49 @@ function readWhitelist(filePath) {
     const json = JSON.parse(raw);
 
     // Supported formats:
-    // 1) ["pkg-a", "pkg-b"]
-    // 2) { "allow": ["pkg-a", "pkg-b"] }
-    const arr = Array.isArray(json) ? json : Array.isArray(json.allow) ? json.allow : [];
-    const set = new Set(arr.map(String));
-    appendAudit(`[WHITELIST] loaded ${set.size} entries from ${filePath}`);
-    return set;
+    // 1) { "allow_list": { "pkg": ["1.0.0"] } }
+    // 2) { "allow": ["pkgA", "pkgB"] }  (legacy: allow all versions for those names)
+    // 3) ["pkgA", "pkgB"]               (legacy)
+    if (json && typeof json === "object" && json.allow_list && typeof json.allow_list === "object") {
+      for (const [name, versions] of Object.entries(json.allow_list)) {
+        const set = new Set(Array.isArray(versions) ? versions.map(String) : []);
+        allowList.set(String(name), set);
+      }
+      appendAudit(`[WHITELIST] loaded allow_list entries=${allowList.size} from ${filePath}`);
+      return allowList;
+    }
+
+    // Legacy name-only allowlist: allow all versions
+    const legacyArr = Array.isArray(json)
+      ? json
+      : Array.isArray(json.allow)
+        ? json.allow
+        : [];
+    for (const name of legacyArr.map(String)) {
+      allowList.set(name, new Set(["*"]));
+    }
+    appendAudit(`[WHITELIST] loaded legacy allow entries=${allowList.size} from ${filePath}`);
+    return allowList;
   } catch (e) {
     appendAudit(`[WHITELIST] failed to parse ${filePath}: ${String(e?.message || e)} (treat as empty)`);
-    return new Set();
+    return new Map();
   }
+}
+
+function isExactVersion(spec) {
+  return /^\d+\.\d+\.\d+$/.test(String(spec).trim());
+}
+
+function isAllowedByWhitelist(allowList, name, requestedSpec) {
+  const set = allowList.get(name);
+  if (!set) return false;
+
+  // Legacy: "*" means allow any spec/version
+  if (set.has("*")) return true;
+
+  // Version-specific: only allow if requested spec is exact and in list
+  if (!isExactVersion(requestedSpec)) return false;
+  return set.has(String(requestedSpec).trim());
 }
 
 function daysBetween(a, b) {
@@ -134,12 +167,12 @@ async function resolveOne(pkgName, spec) {
   };
 }
 
-function applySafeVersionsToPkg(pkg, resolution, whitelist) {
+function applySafeVersionsToPkg(pkg, resolution, allowList) {
   function applySection(sectionName) {
     if (!pkg[sectionName]) return;
     for (const [name, spec] of Object.entries(pkg[sectionName])) {
-      if (whitelist.has(name)) {
-        appendAudit(`[WHITELIST] ${sectionName}.${name}: keep requested spec ${spec}`);
+      if (isAllowedByWhitelist(allowList, name, spec)) {
+        appendAudit(`[WHITELIST] ${sectionName}.${name}: allowed spec ${spec} -> keep`);
         continue;
       }
       const r = resolution.packages?.[name];
@@ -152,26 +185,31 @@ function applySafeVersionsToPkg(pkg, resolution, whitelist) {
   applySection("devDependencies");
 }
 
-// Update shrinkwrap.json packages[] entries for top-level deps we pinned (excluding whitelisted).
-// We clear resolved/integrity to let npm refresh them during install.
-function updateShrinkwrapIfPresent(resolution, whitelist) {
+function updateShrinkwrapIfPresent(resolution, allowList, pkgJson) {
   const shrinkwrapPath = "npm-shrinkwrap.json";
   if (!fs.existsSync(shrinkwrapPath)) return false;
 
   const sw = JSON.parse(fs.readFileSync(shrinkwrapPath, "utf8"));
   const pkgs = sw.packages || {};
 
-  for (const [name, r] of Object.entries(resolution.packages || {})) {
-    if (!r.safe) continue;
-    if (whitelist.has(name)) {
-      appendAudit(`[WHITELIST] shrinkwrap ${name}: keep existing locked version`);
-      continue;
+  // We only touch packages we actually pinned in package.json (non-whitelisted ones).
+  const pinned = new Set();
+  for (const sectionName of ["dependencies", "devDependencies"]) {
+    const section = pkgJson[sectionName] || {};
+    for (const [name, spec] of Object.entries(section)) {
+      // after applySafeVersionsToPkg(), spec is either original (whitelisted) or exact pinned safe.
+      if (!isAllowedByWhitelist(allowList, name, spec) && isExactVersion(spec)) pinned.add(name);
     }
+  }
+
+  for (const name of pinned) {
+    const safe = pkgJson.dependencies?.[name] || pkgJson.devDependencies?.[name];
+    if (!safe) continue;
 
     const key = `node_modules/${name}`;
-    if (pkgs[key] && pkgs[key].version && pkgs[key].version !== r.safe) {
-      appendAudit(`[SHRINKWRAP] ${name}: ${pkgs[key].version} -> ${r.safe}`);
-      pkgs[key].version = r.safe;
+    if (pkgs[key] && pkgs[key].version && pkgs[key].version !== safe) {
+      appendAudit(`[SHRINKWRAP] ${name}: ${pkgs[key].version} -> ${safe}`);
+      pkgs[key].version = safe;
       delete pkgs[key].resolved;
       delete pkgs[key].integrity;
     }
@@ -185,9 +223,9 @@ function updateShrinkwrapIfPresent(resolution, whitelist) {
 
 async function main() {
   fs.mkdirSync("logs", { recursive: true });
-  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (with whitelist) ==========");
+  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (version allow_list) ==========");
 
-  const whitelist = readWhitelist(whitelistFile);
+  const allowList = readWhitelist(whitelistFile);
 
   const pkg = JSON.parse(fs.readFileSync(packageJsonFile, "utf8"));
   const deps = Object.assign({}, pkg.dependencies || {}, pkg.devDependencies || {});
@@ -200,9 +238,9 @@ async function main() {
   };
 
   for (const [name, spec] of Object.entries(deps)) {
-    if (whitelist.has(name)) {
-      resolution.packages[name] = { requested: String(spec), safe: null, reason: "whitelisted" };
-      appendAudit(`[WHITELIST] skip resolving ${name}@${spec}`);
+    if (isAllowedByWhitelist(allowList, name, spec)) {
+      resolution.packages[name] = { requested: String(spec), safe: null, reason: "allow_list" };
+      appendAudit(`[WHITELIST] allowed ${name}@${spec} -> skip resolving`);
       continue;
     }
 
@@ -224,12 +262,12 @@ async function main() {
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
   appendAudit(`Wrote resolution: ${outFile}`);
 
-  applySafeVersionsToPkg(pkg, resolution, whitelist);
+  applySafeVersionsToPkg(pkg, resolution, allowList);
   fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
   appendAudit("Updated package.json with safe versions (runner only).");
 
   if (fs.existsSync("npm-shrinkwrap.json")) {
-    updateShrinkwrapIfPresent(resolution, whitelist);
+    updateShrinkwrapIfPresent(resolution, allowList, pkg);
   } else {
     appendAudit("No npm-shrinkwrap.json found: action will generate one after npm install (npm shrinkwrap).");
   }
