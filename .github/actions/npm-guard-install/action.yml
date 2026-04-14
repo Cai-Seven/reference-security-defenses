@@ -38,17 +38,24 @@ runs:
       env:
         MAX_PACKAGE_AGE_DAYS: ${{ inputs.max_age_days }}
         NPM_REGISTRY_URL: ${{ inputs.registry_url }}
-        RULES_CONFIG_FILE: ${{ inputs.rules_config_file }}
         WHITELIST_FILE: ${{ inputs.whitelist_file }}
         PACKAGE_JSON_FILE: "package.json"
         RESOLUTION_FILE: "logs/npm-guard-resolution.json"
         AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
-      run: node .guard/scripts/resolve-apply-and-sync-shrinkwrap.js
+      run: |
+        set -euo pipefail
+        node .guard/scripts/resolve-apply-and-sync-shrinkwrap.js
+        echo "==== after guard: package.json ===="
+        cat package.json
+        echo "==== after guard: resolution ===="
+        cat logs/npm-guard-resolution.json
+        echo "==== after guard: audit (tail) ===="
+        tail -n 200 logs/npm-guard-audit.log || true
 
     - name: Install (always npm install)
       shell: bash
       run: |
-        set -e
+        set -euo pipefail
         rm -rf node_modules
         npm install
 
