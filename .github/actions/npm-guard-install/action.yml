@@ -15,7 +15,7 @@ inputs:
     required: false
     default: ".guard/config/rules.config.json"
   whitelist_file:
-    description: "Path to whitelist in defenses repo (reserved for compatibility)"
+    description: "Path to whitelist in defenses repo"
     required: false
     default: ".guard/config/package-whitelist.json"
 
