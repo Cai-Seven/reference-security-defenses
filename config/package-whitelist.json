@@ -1,48 +1,6 @@
 {
-  "description": "NPM 包版本白名单 - 通过审批的安全包列表",
-  "lastUpdated": "2026-04-09T00:00:00Z",
-  "globalApprovedPackages": [
-    "@babel/core",
-    "@babel/preset-env",
-    "@babel/preset-react",
-    "@types/node",
-    "@types/react",
-    "react",
-    "react-dom",
-    "typescript",
-    "lodash",
-    "axios",
-    "express",
-    "dotenv",
-    "cors"
-  ],
-  "approvedVersions": {
-    "react": ["18.2.0", "18.2.1", "17.0.2"],
-    "react-dom": ["18.2.0", "18.2.1", "17.0.2"],
-    "typescript": ["5.0.2", "4.9.5", "4.8.4"],
-    "@babel/core": ["7.21.0", "7.20.12", "7.19.6"],
-    "lodash": ["4.17.21"],
-    "axios": ["1.3.4", "1.3.3", "1.3.2"],
-    "express": ["4.18.2", "4.18.1"]
-  },
-  "pendingReview": {
-    "description": "等待审批的包版本",
-    "packages": [
-      {
-        "name": "some-new-package",
-        "version": "1.0.0",
-        "requestedAt": "2026-04-01T10:00:00Z",
-        "reviewStatus": "pending",
-        "reviewer": "security-team"
-      }
-    ]
-  },
-  "blockedPackages": [
-    "description: 已知恶意包，永久黑名单"
-  ],
-  "scanResults": {
-    "lastScan": "2026-04-09T00:00:00Z",
-    "totalApproved": 13,
-    "totalVersions": 28
+  "allow_list": {
+    "type-fest": ["0.3.1", "4.41.0"],
+    "minimist": ["1.2.8"]
   }
 }
