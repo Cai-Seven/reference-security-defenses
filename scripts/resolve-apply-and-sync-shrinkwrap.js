@@ -7,8 +7,16 @@ const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
 const whitelistFile = process.env.WHITELIST_FILE || "";
 
-// If true, never fallback below the minimum base in ^/~ specs.
-// Default false => allow fallback (your desired behavior).
+/**
+ * With cross-major fallback enabled:
+ * - First try: respect requested spec (^/~ or exact) + age gate.
+ * - If none, fallback: choose the newest version (any major) that satisfies age gate.
+ *
+ * This matches: "不用考虑 直接夸大版本" (allow cross-major downgrade freely).
+ */
+const allowCrossMajorFallback = true;
+
+// If true: NEVER fallback, only strict spec.
 const strictSemver = String(process.env.STRICT_SEMVER || "false").toLowerCase() === "true";
 
 function appendAudit(line) {
@@ -42,7 +50,6 @@ function readWhitelist(filePath) {
       return allowList;
     }
 
-    // Legacy name-only allowlist: allow all versions
     const legacyArr = Array.isArray(json) ? json : Array.isArray(json.allow) ? json.allow : [];
     for (const name of legacyArr.map(String)) {
       allowList.set(name, new Set(["*"]));
@@ -110,42 +117,19 @@ function sameMajorMinor(a, b) {
 function allowedBySpecStrict(version, spec) {
   const s = String(spec).trim();
 
-  if (/^\d+\.\d+\.\d+$/.test(s)) return version === s;
+  if (isExactVersion(s)) return version === s;
 
   const base = minBaseFromSpec(s);
   if (!base) return false;
 
   if (s.startsWith("^")) {
-    // ^x.y.z => same major and >= base
     if (!sameMajor(version, base)) return false;
     return cmpVer(version, base) >= 0;
   }
 
   if (s.startsWith("~")) {
-    // ~x.y.z => same major.minor and >= base
     if (!sameMajorMinor(version, base)) return false;
     return cmpVer(version, base) >= 0;
-  }
-
-  return false;
-}
-
-function allowedBySpecFallback(version, spec) {
-  const s = String(spec).trim();
-
-  if (/^\d+\.\d+\.\d+$/.test(s)) return version === s;
-
-  const base = minBaseFromSpec(s);
-  if (!base) return false;
-
-  if (s.startsWith("^")) {
-    // fallback: same major only (ignore >= base)
-    return sameMajor(version, base);
-  }
-
-  if (s.startsWith("~")) {
-    // fallback: same major.minor only (ignore >= base)
-    return sameMajorMinor(version, base);
   }
 
   return false;
@@ -160,25 +144,24 @@ async function resolveOne(pkgName, spec) {
   const now = new Date();
   const cutoff = new Date(now.getTime() - maxAgeDays * 24 * 3600 * 1000);
 
-  function pickCandidates(allowedFn) {
+  function candidatesByFilter(fn) {
     return versions
-      .filter((v) => allowedFn(v, spec))
+      .filter((v) => fn(v))
       .filter((v) => times[v])
       .map((v) => ({ v, t: new Date(times[v]) }))
       .filter((x) => x.t <= cutoff)
       .sort((a, b) => cmpVer(a.v, b.v));
   }
 
-  // 1) strict
-  let candidates = pickCandidates(allowedBySpecStrict);
+  // 1) strict per requested spec
+  let candidates = candidatesByFilter((v) => allowedBySpecStrict(v, spec));
 
-  // 2) fallback (only for ^/~, and only when not strictSemver)
-  const s = String(spec).trim();
-  const canFallback = !strictSemver && (/^[\^~]\d+\.\d+\.\d+$/.test(s));
+  // 2) fallback: any version (cross-major) as long as it meets age gate
+  const canFallback = !strictSemver && allowCrossMajorFallback;
   if (candidates.length === 0 && canFallback) {
-    candidates = pickCandidates(allowedBySpecFallback);
+    candidates = candidatesByFilter(() => true);
     if (candidates.length > 0) {
-      appendAudit(`[FALLBACK] ${pkgName}@${spec} -> using older version within ${s[0] === "^" ? "major" : "major.minor"} due to age gate`);
+      appendAudit(`[FALLBACK] ${pkgName}@${spec} -> using cross-major fallback due to age gate`);
     }
   }
 
@@ -186,7 +169,7 @@ async function resolveOne(pkgName, spec) {
     return {
       requested: String(spec),
       safe: null,
-      reason: `no version satisfies age>=${maxAgeDays}d under ${canFallback ? "strict+fallback" : "strict"} rules`,
+      reason: `no version satisfies age>=${maxAgeDays}d under ${canFallback ? "strict+cross-major-fallback" : "strict"} rules`,
     };
   }
 
@@ -198,6 +181,7 @@ async function resolveOne(pkgName, spec) {
     safe: chosen.v,
     publishTime: chosen.t.toISOString(),
     ageDays: Number(age.toFixed(2)),
+    fallback: candidates.length > 0 && !allowedBySpecStrict(chosen.v, spec),
   };
 }
 
@@ -211,8 +195,8 @@ function applySafeVersionsToPkg(pkg, resolution, allowList) {
       }
       const r = resolution.packages?.[name];
       if (!r || !r.safe) continue;
-      pkg[sectionName][name] = r.safe; // pin exact
-      appendAudit(`[APPLY] ${sectionName}.${name}: ${spec} -> ${r.safe}`);
+      pkg[sectionName][name] = r.safe; // pin exact to the chosen safe version
+      appendAudit(`[APPLY] ${sectionName}.${name}: ${spec} -> ${r.safe}${r.fallback ? " (cross-major fallback)" : ""}`);
     }
   }
   applySection("dependencies");
@@ -262,9 +246,10 @@ async function main() {
   console.log("[npm-guard] packageJsonFile:", packageJsonFile);
   console.log("[npm-guard] whitelistFile:", whitelistFile);
   console.log("[npm-guard] strictSemver:", strictSemver);
+  console.log("[npm-guard] allowCrossMajorFallback:", allowCrossMajorFallback);
 
   fs.mkdirSync("logs", { recursive: true });
-  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (version allow_list + fallback) ==========");
+  appendAudit("========== NPM Guard Resolve+Apply+Shrinkwrap (version allow_list + cross-major fallback) ==========");
 
   const allowList = readWhitelist(whitelistFile);
 
@@ -292,7 +277,7 @@ async function main() {
       resolution.packages[name] = r;
 
       if (r.safe) {
-        appendAudit(`[SAFE] ${name}@${spec} -> ${r.safe} (ageDays=${r.ageDays})`);
+        appendAudit(`[SAFE] ${name}@${spec} -> ${r.safe} (ageDays=${r.ageDays})${r.fallback ? " [FALLBACK]" : ""}`);
       } else {
         appendAudit(`[UNRESOLVED] ${name}@${spec} -> (no safe version) reason=${r.reason}`);
       }
