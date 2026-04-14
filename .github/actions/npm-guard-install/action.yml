@@ -1,3 +1,23 @@
+name: "npm-guard-install"
+description: "Auto-resolve safe versions (age-gated) and install deterministically"
+inputs:
+  max_age_days:
+    description: "Minimum age of package versions (days)"
+    required: false
+    default: "14"
+  registry_url:
+    description: "NPM registry URL"
+    required: false
+    default: "https://registry.npmjs.org"
+  rules_config_file:
+    description: "Path to rules config in defenses repo (reserved for compatibility)"
+    required: false
+    default: ".guard/config/rules.config.json"
+  whitelist_file:
+    description: "Path to whitelist in defenses repo (reserved for compatibility)"
+    required: false
+    default: ".guard/config/package-whitelist.json"
+
 runs:
   using: "composite"
   steps:
@@ -12,33 +32,28 @@ runs:
       shell: bash
       run: mkdir -p logs
 
-    # 关键：不再阻断；生成“安全版本建议表”
-    - name: Resolve safe versions (no block)
+    # Resolve safe versions and apply them to package.json in the current workspace
+    # (runner only; nothing is committed back to the app repo).
+    - name: Resolve + apply safe versions (runner only)
       shell: bash
       env:
         MAX_PACKAGE_AGE_DAYS: ${{ inputs.max_age_days }}
         NPM_REGISTRY_URL: ${{ inputs.registry_url }}
         RULES_CONFIG_FILE: ${{ inputs.rules_config_file }}
         WHITELIST_FILE: ${{ inputs.whitelist_file }}
-        AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
         PACKAGE_JSON_FILE: "package.json"
         RESOLUTION_FILE: "logs/npm-guard-resolution.json"
-      run: node .guard/scripts/resolve-safe-versions.js
+        AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
+      run: node .guard/scripts/resolve-and-apply-safe-versions.js
 
-    # 关键：把依赖临时改成安全版本（只改 runner 工作区，不提交）
-    - name: Apply safe versions to package.json (runner only)
-      shell: bash
-      env:
-        RESOLUTION_FILE: "logs/npm-guard-resolution.json"
-      run: node .guard/scripts/apply-safe-versions.js
-
-    # 生成临时 lockfile + 用 lockfile 固定安装
+    # Create/refresh lockfile based on the now-safe pinned versions (runner only)
     - name: Generate package-lock.json (runner only)
       shell: bash
       run: |
         rm -rf node_modules
         npm install --package-lock-only --ignore-scripts
 
+    # Deterministic install
     - name: Install from lockfile
       shell: bash
       run: |
