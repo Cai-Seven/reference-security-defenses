@@ -18,6 +18,8 @@ runs:
     - name: Resolve + apply safe versions (runner only)
       shell: bash
       env:
+        NPM_GUARD_CONFIG_FILE: ".guard/config/npm-guard.config.json"
+        NPM_GUARD_ALLOW_LIST_FILE: ".guard/config/package-whitelist.json"
         PACKAGE_JSON_FILE: "package.json"
         RESOLUTION_FILE: "logs/npm-guard-resolution.json"
         AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
@@ -29,7 +31,6 @@ runs:
         set -euo pipefail
         rm -rf node_modules
         npm install
-
         if [ ! -f npm-shrinkwrap.json ]; then
           npm shrinkwrap
         fi
