@@ -1,5 +1,5 @@
 name: "npm-guard-install"
-description: "Auto-resolve safe versions (age-gated) and install deterministically"
+description: "Auto-resolve safe versions (age-gated), update shrinkwrap if present, generate shrinkwrap if absent, then npm install"
 
 inputs:
   max_age_days:
@@ -33,7 +33,7 @@ runs:
       shell: bash
       run: mkdir -p logs
 
-    - name: Resolve + apply safe versions (runner only)
+    - name: Resolve + apply safe versions + pre-sync shrinkwrap (runner only)
       shell: bash
       env:
         MAX_PACKAGE_AGE_DAYS: ${{ inputs.max_age_days }}
@@ -43,18 +43,17 @@ runs:
         PACKAGE_JSON_FILE: "package.json"
         RESOLUTION_FILE: "logs/npm-guard-resolution.json"
         AUDIT_LOG_FILE: "logs/npm-guard-audit.log"
-      run: node .guard/scripts/resolve-and-apply-safe-versions.js
+      run: node .guard/scripts/resolve-apply-and-sync-shrinkwrap.js
 
-    - name: Generate package-lock.json (runner only)
+    - name: Install (always npm install)
       shell: bash
       run: |
+        set -e
         rm -rf node_modules
-        rm -f package-lock.json npm-shrinkwrap.json
-        npm install --package-lock-only --ignore-scripts
-
-    - name: Install (sync lockfile automatically)
-      shell: bash
-      run: |
-        rm -rf node_modules
-        rm -f package-lock.json npm-shrinkwrap.json
         npm install
+
+        # If product didn't ship shrinkwrap, generate one after a successful install.
+        if [ ! -f npm-shrinkwrap.json ]; then
+          echo "No npm-shrinkwrap.json present -> generating via npm shrinkwrap"
+          npm shrinkwrap
+        fi
