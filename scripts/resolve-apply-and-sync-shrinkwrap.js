@@ -1,6 +1,7 @@
 const fs = require("fs");
 
 const configPath = process.env.NPM_GUARD_CONFIG_FILE || ".guard/config/npm-guard.config.json";
+const allowListPath = process.env.NPM_GUARD_ALLOW_LIST_FILE || ".guard/config/package-whitelist.json";
 const packageJsonFile = process.env.PACKAGE_JSON_FILE || "package.json";
 const outFile = process.env.RESOLUTION_FILE || "logs/npm-guard-resolution.json";
 const auditFile = process.env.AUDIT_LOG_FILE || "logs/npm-guard-audit.log";
@@ -33,6 +34,7 @@ async function fetchJson(url) {
   return res.json();
 }
 
+// Supports only: exact x.y.z, ^x.y.z, ~x.y.z
 function minBaseFromSpec(spec) {
   const s = String(spec).trim();
   if (isExactVersion(s)) return s;
@@ -81,14 +83,43 @@ function allowedBySpecStrict(version, spec) {
   return false;
 }
 
-function isAllowedByWhitelist(allowList, name, requestedSpec) {
-  const set = allowList[name];
-  if (!set) return false;
+function loadAllowList(filePath) {
+  if (!filePath) return {};
 
-  if (set === "*" || (Array.isArray(set) && set.includes("*"))) return true;
+  if (!fs.existsSync(filePath)) {
+    appendAudit(`[ALLOW_LIST] file not found: ${filePath} (treat as empty)`);
+    return {};
+  }
+
+  try {
+    const json = readJson(filePath);
+
+    // Supported formats:
+    // 1) { "allow_list": { "pkg": ["1.0.0"] } }
+    // 2) { "allow": ["pkgA", "pkgB"] }  (legacy: allow all versions for those names)
+    // 3) ["pkgA", "pkgB"]               (legacy)
+    if (json && typeof json === "object" && json.allow_list && typeof json.allow_list === "object") {
+      return json.allow_list;
+    }
+
+    const legacyArr = Array.isArray(json) ? json : Array.isArray(json.allow) ? json.allow : [];
+    const allow = {};
+    for (const name of legacyArr.map(String)) allow[name] = ["*"];
+    return allow;
+  } catch (e) {
+    appendAudit(`[ALLOW_LIST] failed to parse ${filePath}: ${String(e?.message || e)} (treat as empty)`);
+    return {};
+  }
+}
+
+function isAllowedByAllowList(allowList, name, requestedSpec) {
+  const rule = allowList[name];
+  if (!rule) return false;
+
+  if (rule === "*" || (Array.isArray(rule) && rule.includes("*"))) return true;
 
   if (!isExactVersion(requestedSpec)) return false;
-  return Array.isArray(set) && set.includes(String(requestedSpec).trim());
+  return Array.isArray(rule) && rule.includes(String(requestedSpec).trim());
 }
 
 async function resolveOne(meta, pkgName, spec) {
@@ -115,6 +146,9 @@ async function resolveOne(meta, pkgName, spec) {
 
   if (candidates.length === 0 && allowCrossMajorFallback) {
     candidates = candidatesByFilter((v) => (fallbackOnlyStable ? isStableSemver(v) : true));
+    if (candidates.length > 0) {
+      appendAudit(`[FALLBACK] ${pkgName}@${spec} -> selected stable version outside requested range`);
+    }
   }
 
   if (candidates.length === 0) {
@@ -139,8 +173,7 @@ function applySafeVersionsToPkg(pkg, resolution, allowList) {
     if (!section) continue;
 
     for (const [name, spec] of Object.entries(section)) {
-      if (isAllowedByWhitelist(allowList, name, spec)) {
-        appendAudit(`[WHITELIST] ${sectionName}.${name}: keep ${spec}`);
+      if (isAllowedByAllowList(allowList, name, spec)) {
         continue;
       }
       const r = resolution.packages?.[name];
@@ -183,12 +216,13 @@ async function main() {
   }
 
   const config = readJson(configPath);
+  const allowList = loadAllowList(allowListPath);
+
   const meta = {
     registryUrl: config.registry_url || "https://registry.npmjs.org",
     maxAgeDays: Number(config.max_age_days || 14),
     allowCrossMajorFallback: config.allow_cross_major_fallback !== false,
     fallbackOnlyStable: config.fallback_only_stable !== false,
-    allowList: config.allow_list || {},
   };
 
   fs.mkdirSync("logs", { recursive: true });
@@ -204,7 +238,7 @@ async function main() {
   };
 
   for (const [name, spec] of Object.entries(deps)) {
-    if (isAllowedByWhitelist(meta.allowList, name, spec)) {
+    if (isAllowedByAllowList(allowList, name, spec)) {
       resolution.packages[name] = { requested: String(spec), safe: null, reason: "allow_list" };
       continue;
     }
@@ -212,7 +246,8 @@ async function main() {
   }
 
   fs.writeFileSync(outFile, JSON.stringify(resolution, null, 2));
-  applySafeVersionsToPkg(pkg, resolution, meta.allowList);
+
+  applySafeVersionsToPkg(pkg, resolution, allowList);
   fs.writeFileSync(packageJsonFile, JSON.stringify(pkg, null, 2) + "\n");
 
   updateShrinkwrapIfPresent(pkg);
